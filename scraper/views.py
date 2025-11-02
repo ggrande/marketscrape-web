@@ -1,104 +1,162 @@
+from __future__ import annotations
+
+import logging
+import re
+
 from django.shortcuts import render
 from django.views import View
+
+from . import utils
+from .exceptions import InvalidDataFormat, NoProductsFound, ScraperRequestError
 from .forms import MarketForm
-from .utils import *
-from .shop_class import EbayScraper
 from .marketplace_class import FacebookMarketplaceScraper
+from .shop_class import EbayScraper
+
+logger = logging.getLogger(__name__)
+
 
 class Index(View):
     def get(self, request):
         form = MarketForm()
-        context = {'form': form}
-        
-        return render(request, 'scraper/index.html', context)
+        context = {"form": form}
+        return render(request, "scraper/index.html", context)
 
     def post(self, request):
         form = MarketForm(request.POST)
-        if form.is_valid():
-            url = form.cleaned_data['url']
+        if not form.is_valid():
+            return render(request, "scraper/index.html", {"form": form})
 
-            # Shorten the URL and create a mobile URL
-            shortened_url = re.search(r".*[0-9]", url).group(0)
-            mobile_url = shortened_url.replace("www", "m")
+        url = form.cleaned_data["url"]
+        match = re.search(r".*[0-9]", url)
+        if not match:
+            form.add_error("url", "The provided URL does not contain a listing identifier.")
+            return render(request, "scraper/index.html", {"form": form})
 
-            # Create soup objects from the desktop and mobile versions of the page
-            mobile_soup = create_soup(mobile_url, headers=None)
-            base_soup = create_soup(url, headers=None)
+        shortened_url = match.group(0)
+        mobile_url = re.sub(r"//www\.", "//m.", shortened_url)
 
-            # Create a FacebookScraper instance
+        try:
+            mobile_soup = utils.create_soup(mobile_url)
+            base_soup = utils.create_soup(url)
+        except ScraperRequestError:
+            logger.warning("Failed to fetch Marketplace listing %s", url, exc_info=True)
+            form.add_error(None, "We couldn't reach Facebook Marketplace. Please try again later.")
+            return render(request, "scraper/index.html", {"form": form})
+        except InvalidDataFormat as exc:
+            form.add_error("url", str(exc))
+            return render(request, "scraper/index.html", {"form": form})
+
+        try:
             facebook_instance = FacebookMarketplaceScraper(mobile_soup, base_soup)
+        except InvalidDataFormat as exc:
+            logger.warning("Marketplace listing metadata invalid for %s", url, exc_info=True)
+            form.add_error(None, str(exc))
+            return render(request, "scraper/index.html", {"form": form})
 
-            # Check if the listing is missing
-            if facebook_instance.is_listing_missing():
-                return render(request, 'scraper/missing.html')
-            
-            # Get the listing data
-            image = facebook_instance.get_listing_image()
-            days, hours = facebook_instance.get_listing_date()
-            description = facebook_instance.get_listing_description()
-            title = facebook_instance.get_listing_title()
-            condition = facebook_instance.get_listing_condition()
-            category = facebook_instance.get_listing_category()
-            price = facebook_instance.get_listing_price()
-            city = facebook_instance.get_listing_city()
-            currency = facebook_instance.get_listing_currency()
+        if facebook_instance.is_listing_missing():
+            return render(request, "scraper/missing.html")
 
-            # Create a GoogleShoppingScraper instance
-            shopping_instance = EbayScraper()
+        image = facebook_instance.get_listing_image()
+        days, hours = facebook_instance.get_listing_date()
+        description = facebook_instance.get_listing_description()
+        title = facebook_instance.get_listing_title()
+        condition = facebook_instance.get_listing_condition()
+        category = facebook_instance.get_listing_category()
+        price = facebook_instance.get_listing_price()
+        city = facebook_instance.get_listing_city()
+        currency = facebook_instance.get_listing_currency()
 
-            # Find viable products based on the title
-            cleaned_title = remove_illegal_characters(title)
-            similar_descriptions, similar_prices, similar_shipping, similar_countries, similar_conditions, similar_scores = shopping_instance.find_viable_product(cleaned_title, ramp_down=0.0)
-            candidates = shopping_instance.construct_candidates(similar_descriptions, similar_prices, similar_shipping, similar_countries, similar_conditions, similar_scores)
+        shopping_instance = EbayScraper()
 
-            # Convert prices to float and shorten the descriptions if necessary
-            similar_prices = [float(price.replace(',', '')) for price in similar_prices]
-            similar_shipping = [float(ship.replace(',', '')) for ship in similar_shipping]
+        cleaned_title = utils.remove_illegal_characters(title)
+        try:
+            (
+                similar_descriptions,
+                similar_prices,
+                similar_shipping,
+                similar_countries,
+                similar_conditions,
+                similar_scores,
+            ) = shopping_instance.find_viable_product(cleaned_title, ramp_down=0.0)
+        except NoProductsFound:
+            form.add_error(None, "We couldn't find comparable listings on eBay.")
+            return render(request, "scraper/index.html", {"form": form})
 
-            # Based on the best similar product, get the price, description, and country
+        candidates = shopping_instance.construct_candidates(
+            similar_descriptions,
+            similar_prices,
+            similar_shipping,
+            similar_countries,
+            similar_conditions,
+            similar_scores,
+        )
+
+        try:
+            similar_prices_float = [float(price.replace(",", "")) for price in similar_prices]
+            similar_shipping_float = [float(ship.replace(",", "")) for ship in similar_shipping]
+        except ValueError:
+            form.add_error(None, "We couldn't parse eBay pricing data.")
+            return render(request, "scraper/index.html", {"form": form})
+
+        try:
             best_product = shopping_instance.lowest_price_highest_similarity(candidates)
+        except NoProductsFound:
+            form.add_error(None, "We couldn't determine the best comparable listing.")
+            return render(request, "scraper/index.html", {"form": form})
 
-            idx = similar_countries.index(best_product[1]["country"])
-            best_price = f"{similar_prices[idx]:,.2f}"
-            best_shipping = f"{similar_shipping[idx]:,.2f}"
-            best_title = similar_descriptions[idx]
-            best_score = best_product[1]["similarity"] * 100
+        best_description, best_details = best_product
+        best_price = float(best_details["price"])
+        best_shipping = float(best_details["shipping"])
+        best_country = best_details["country"]
+        best_score = best_details["similarity"] * 100
 
-            # Percetage difference between the listing price and the best found price (including shipping)
-            best_total = float(best_price.replace(",", "")) + float(best_shipping.replace(",", ""))
-            best_context = percentage_difference(float(price), best_total,)
-            price_rating = price_difference_rating(float(price), best_total, days)
+        try:
+            idx = similar_countries.index(best_country)
+        except ValueError:
+            idx = 0
 
-            # Categorize the titles and create the chart and bargraph
-            chart = create_chart(similar_prices, similar_shipping, similar_descriptions, similar_conditions, currency, title, best_title)
-            bargraph = create_bargraph(similar_countries)   
+        best_price_display = f"{similar_prices_float[idx]:,.2f}"
+        best_shipping_display = f"{similar_shipping_float[idx]:,.2f}"
 
-            # Get the total number of items
-            total_items = len(similar_descriptions)
+        best_total = best_price + best_shipping
+        best_context = utils.percentage_difference(price, best_total)
+        price_rating = utils.price_difference_rating(price, best_total, days)
 
-            # Create the context 
-            context = {
-                'shortened_url': shortened_url,
-                'mobile_url': mobile_url,
-                'title': title,
-                'price': f"{float(price):,.2f}",
-                'chart': chart,
-                'bargraph': bargraph,
-                'price_rating': round(price_rating, 1),
-                'days': days,
-                'hours': hours,
-                'image': image,
-                'description': description,
-                'condition': condition,
-                'category': category,
-                'city': city,
-                'currency': currency,
-                'total_items': total_items,
-                'best_price': best_price,
-                'best_shipping': best_shipping,
-                'best_title': best_title.title(),
-                'best_score': round(best_score, 2),
-                'best_context': best_context
-            }
+        chart = utils.create_chart(
+            similar_prices_float,
+            similar_shipping_float,
+            similar_descriptions,
+            similar_conditions,
+            currency,
+            title,
+            best_description,
+        )
+        bargraph = utils.create_bargraph(similar_countries)
 
-            return render(request, 'scraper/result.html', context)
+        total_items = len(similar_descriptions)
+
+        context = {
+            "shortened_url": shortened_url,
+            "mobile_url": mobile_url,
+            "title": title,
+            "price": f"{float(price):,.2f}",
+            "chart": chart,
+            "bargraph": bargraph,
+            "price_rating": round(price_rating, 1),
+            "days": days,
+            "hours": hours,
+            "image": image,
+            "description": description,
+            "condition": condition,
+            "category": category,
+            "city": city,
+            "currency": currency,
+            "total_items": total_items,
+            "best_price": best_price_display,
+            "best_shipping": best_shipping_display,
+            "best_title": best_description.title(),
+            "best_score": round(best_score, 2),
+            "best_context": best_context,
+        }
+
+        return render(request, "scraper/result.html", context)
