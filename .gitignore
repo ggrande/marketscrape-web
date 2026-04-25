@@ -1,2 +1,11 @@
 # Ignore all pycache files
 *.pyc
+
+# Next.js / Node for web/
+web/node_modules/
+web/.next/
+web/out/
+web/.env
+web/.env.local
+web/next-env.d.ts
+web/tsconfig.tsbuildinfo
